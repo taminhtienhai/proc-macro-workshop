@@ -52,6 +52,12 @@ pub struct Command {
     current_dir: String,
 }
 
+impl Command {
+    pub fn build(self) -> core::result::Result<Self, Box<dyn std::error::Error>> {
+        Ok(self)
+    }
+}
+
 fn main() {
     let builder = Command::builder();
 
