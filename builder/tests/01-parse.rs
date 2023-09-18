@@ -21,8 +21,6 @@
 //   - An example of a derive macro implemented using Syn:
 //     https://github.com/dtolnay/syn/tree/master/examples/heapsize
 
-use std::marker::PhantomData;
-
 use derive_builder::Builder;
 
 #[derive(Builder)]

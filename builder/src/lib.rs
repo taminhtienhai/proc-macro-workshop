@@ -1,27 +1,37 @@
-mod field_parser;
-mod struct_parser;
-
 use proc_macro::TokenStream;
-use proc_macro2::Ident;
-use quote::{quote, format_ident};
-use syn::{parse_macro_input, DeriveInput, Generics, GenericParam, punctuated::Punctuated, Token, token::Comma, braced, Field};
+use proc_macro2::{Ident, Span, TokenStream as TokenStream2};
+use quote::{format_ident, quote};
+use syn::{
+    parse_macro_input, punctuated::Punctuated, token::Comma, AngleBracketedGenericArguments,
+    DeriveInput, Error, Field, GenericArgument, GenericParam, Generics, Path, PathArguments,
+    PathSegment, Type, TypePath,
+};
 
 #[proc_macro_derive(Builder)]
-pub fn derive(input: TokenStream) -> TokenStream {
-    let DeriveInput {
+pub fn impl_struct_builder(input: TokenStream) -> TokenStream {
+    let derive_input = parse_macro_input!(input as DeriveInput);
+    match struct_builder(derive_input) {
+        Ok(tokens) => TokenStream::from(tokens),
+        Err(err) => TokenStream::from(err.to_compile_error()),
+    }
+}
+
+fn struct_builder(
+    DeriveInput {
         data,
         generics,
         ident,
         ..
-    } = parse_macro_input!(input as DeriveInput);
-
+    }: DeriveInput,
+) -> syn::Result<TokenStream2> {
     let Generics {
         params,
         where_clause,
         ..
     } = &generics;
 
-    let gen_idents = params.iter()
+    let gen_idents = params
+        .iter()
         .filter(|it| match it {
             GenericParam::Lifetime(_) => false,
             _ => true,
@@ -29,40 +39,57 @@ pub fn derive(input: TokenStream) -> TokenStream {
         .map(|it| match it {
             GenericParam::Type(ty) => ty.ident.clone(),
             GenericParam::Const(cons) => cons.ident.clone(),
-            _ => panic!("")
+            _ => panic!("Lifetime does not allow here"),
         })
         .fold(Punctuated::<Ident, Comma>::default(), |mut acc, cur| {
             acc.push(cur);
             acc
         });
 
-    let fields = match data {
+    let props = match data {
         syn::Data::Struct(body) => match body.fields {
             syn::Fields::Named(fields) => fields.named,
-            _ => panic!("Only support named fields"),
+            _ => return Err(Error::new(Span::call_site(), "Only support named property")),
         },
-        _ => panic!("Not a struct"),
+        _ => return Err(Error::new(Span::call_site(), "support struct only")),
     };
     let builder_ident = format_ident!("{}Builder", ident);
 
-
-    let builder_fns = fields.iter()
-        .map(|Field { ident, ty, .. }| {
-            quote! {
-                pub fn #ident(&mut self, value: #ty) {
-                    self.#ident = value;
+    let builder_props = props
+        .iter()
+        .map(|Field { ident, ty, .. }| quote!(#ident: core::option::Option<#ty>));
+    let builder_fns = props.iter().map(|Field { ident, ty, .. }| {
+        match check_ty(ty) {
+            TypeInfer::Option(t) => {
+                quote! {
+                    pub fn #ident(&mut self, value: #t) -> &mut Self {
+                        self.#ident = Some(Some(value));
+                        self
+                    }
+                }
+            },
+            _ => quote! {
+                pub fn #ident(&mut self, value: #ty) -> &mut Self {
+                    self.#ident = Some(value);
+                    self
                 }
             }
+        }
+    });
+    let init_default_props = props
+        .iter()
+        .map(|Field { vis, ident, ty, .. }| match check_ty(ty) {
+            TypeInfer::Option(_) => {
+                quote!(#vis #ident: Some(None))
+            },
+            _ => quote!(#vis #ident: None),
         });
-    let init_default_props = fields.iter()
-        .map(|Field { vis, ident, .. }| {
-            quote!(#vis #ident: core::default::Default::default())
-        });
-    let build_props = fields.iter()
-        .map(|Field { ident, .. }| {
-            quote!(#ident: self.#ident)
-        });
-    quote! {
+    let build_props = props.iter().map(|Field { ident, .. }| {
+        quote!(
+            #ident: self.#ident.take().ok_or(format!("`{}` is required", stringify!(#ident)))?
+        )
+    });
+    Ok(quote! {
         impl <#params> #ident <#gen_idents> #where_clause {
             pub fn builder() -> #builder_ident {
                 #builder_ident {
@@ -70,19 +97,59 @@ pub fn derive(input: TokenStream) -> TokenStream {
                 }
             }
         }
-        
+
         pub struct #builder_ident <#params> #where_clause {
-            #fields
+            #(#builder_props,)*
         }
 
         impl <#params> #builder_ident <#gen_idents> #where_clause {
             #(#builder_fns)*
 
-            pub fn build(self) -> core::result::Result<#ident, Box<dyn std::error::Error>> {
+            pub fn build(&mut self) -> core::result::Result<#ident, Box<dyn std::error::Error>> {
                 Ok(#ident {
                     #(#build_props,)*
                 })
             }
         }
-    }.into()
+    }
+    .into())
+}
+
+fn check_ty(ty: &Type) -> TypeInfer {
+    match ty {
+        Type::Path(TypePath {
+            qself: _,
+            path:
+                Path {
+                    segments,
+                    leading_colon,
+                },
+        }) if leading_colon.is_none() && segments.len() == 1 => {
+            if let Some(PathSegment {
+                ident,
+                arguments:
+                    PathArguments::AngleBracketed(AngleBracketedGenericArguments { args, .. }),
+            }) = segments.first()
+            {
+                let mut r_ty = TypeInfer::Other;
+                if let (1, Some(GenericArgument::Type(t))) = (args.len(), args.first()) {
+                    if ident == "Option" {
+                        r_ty = TypeInfer::Option(t.clone());
+                    } else if ident == "Vec" {
+                        r_ty = TypeInfer::Vec;
+                    }
+                }
+                r_ty
+            } else {
+                TypeInfer::Other
+            }
+        }
+        _ => TypeInfer::Other,
+    }
+}
+
+enum TypeInfer {
+    Option(Type),
+    Vec,
+    Other,
 }
