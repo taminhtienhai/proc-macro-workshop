@@ -1,3 +1,6 @@
+mod builder_macro_v2;
+
+use builder_macro_v2::FieldMetadata;
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
@@ -7,7 +10,7 @@ use syn::{
     PathSegment, Type, TypePath,
 };
 
-#[proc_macro_derive(Builder)]
+#[proc_macro_derive(Builder, attributes(builder))]
 pub fn impl_struct_builder(input: TokenStream) -> TokenStream {
     let derive_input = parse_macro_input!(input as DeriveInput);
     match struct_builder(derive_input) {
@@ -46,6 +49,7 @@ fn struct_builder(
             acc
         });
 
+
     let props = match data {
         syn::Data::Struct(body) => match body.fields {
             syn::Fields::Named(fields) => fields.named,
@@ -55,10 +59,22 @@ fn struct_builder(
     };
     let builder_ident = format_ident!("{}Builder", ident);
 
+    let field_metadata: Vec<FieldMetadata> = props
+        .iter()
+        .map(|field| field.into())
+        .collect();
+
+    let builder_fns_v2 = field_metadata
+        .into_iter()
+        .map(|it| it.impl_attr_setter_fns().unwrap())
+        .collect::<Vec<_>>();
+
     let builder_props = props
         .iter()
-        .map(|Field { ident, ty, .. }| quote!(#ident: core::option::Option<#ty>));
-    let builder_fns = props.iter().map(|Field { ident, ty, .. }| {
+        .map(|Field { ident, ty, .. }| {
+            quote!(#ident: core::option::Option<#ty>)
+        });
+    let _builder_fns = props.iter().map(|Field { ident, ty, .. }| {
         match check_ty(ty) {
             TypeInfer::Option(t) => {
                 quote! {
@@ -82,6 +98,9 @@ fn struct_builder(
             TypeInfer::Option(_) => {
                 quote!(#vis #ident: Some(None))
             },
+            TypeInfer::Vec => {
+                quote!(#vis #ident: Some(vec![]))
+            },
             _ => quote!(#vis #ident: None),
         });
     let build_props = props.iter().map(|Field { ident, .. }| {
@@ -89,6 +108,7 @@ fn struct_builder(
             #ident: self.#ident.take().ok_or(format!("`{}` is required", stringify!(#ident)))?
         )
     });
+
     Ok(quote! {
         impl <#params> #ident <#gen_idents> #where_clause {
             pub fn builder() -> #builder_ident {
@@ -103,7 +123,7 @@ fn struct_builder(
         }
 
         impl <#params> #builder_ident <#gen_idents> #where_clause {
-            #(#builder_fns)*
+            #(#builder_fns_v2)*
 
             pub fn build(&mut self) -> core::result::Result<#ident, Box<dyn std::error::Error>> {
                 Ok(#ident {
@@ -122,28 +142,26 @@ fn check_ty(ty: &Type) -> TypeInfer {
             path:
                 Path {
                     segments,
-                    leading_colon,
+                    leading_colon: _,
                 },
-        }) if leading_colon.is_none() && segments.len() == 1 => {
-            if let Some(PathSegment {
-                ident,
-                arguments:
-                    PathArguments::AngleBracketed(AngleBracketedGenericArguments { args, .. }),
-            }) = segments.first()
-            {
-                let mut r_ty = TypeInfer::Other;
-                if let (1, Some(GenericArgument::Type(t))) = (args.len(), args.first()) {
-                    if ident == "Option" {
-                        r_ty = TypeInfer::Option(t.clone());
-                    } else if ident == "Vec" {
-                        r_ty = TypeInfer::Vec;
-                    }
+        }) => if let Some(PathSegment {
+            ident,
+            arguments:
+                PathArguments::AngleBracketed(AngleBracketedGenericArguments { args, .. }),
+        }) = segments.last()
+        {
+            let mut r_ty = TypeInfer::Other;
+            if let (1, Some(GenericArgument::Type(t))) = (args.len(), args.first()) {
+                if ident == "Option" {
+                    r_ty = TypeInfer::Option(t.clone());
+                } else if ident == "Vec" {
+                    r_ty = TypeInfer::Vec;
                 }
-                r_ty
-            } else {
-                TypeInfer::Other
             }
-        }
+            r_ty
+        } else {
+            TypeInfer::Other
+        },
         _ => TypeInfer::Other,
     }
 }
